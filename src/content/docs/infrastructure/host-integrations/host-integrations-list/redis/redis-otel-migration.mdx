@@ -1,0 +1,540 @@
+---
+title: Migrate from nri-redis to OpenTelemetry Redis monitoring
+tags:
+  - OpenTelemetry
+  - Redis
+  - Integrations
+  - Migration
+metaDescription: "Migrate from the New Relic Infrastructure Redis integration (nri-redis) to OpenTelemetry-based Redis monitoring with metric mapping and configuration translation."
+freshnessValidatedDate: never
+---
+
+{/* TODO: Gate page visibility behind feature flag ohai.redis.otel_integration */}
+
+This guide helps you migrate from the New Relic Infrastructure Redis integration (nri-redis) to OpenTelemetry-based Redis monitoring. The OTel Redis receiver provides the same core metrics through the OpenTelemetry Collector, with additional benefits including vendor-neutral instrumentation and a broader community ecosystem.
+
+## Why migrate to OpenTelemetry [#why-migrate]
+
+Migrating from nri-redis to the OpenTelemetry Redis receiver provides several benefits:
+
+* **Vendor-neutral instrumentation** - Use the same collector for multiple backends without vendor lock-in
+* **Broader community support** - The OTel Redis receiver is maintained by the OpenTelemetry community with frequent updates
+* **Unified collector** - Monitor Redis alongside other services (databases, message queues, applications) through a single OpenTelemetry Collector instance
+* **Per-command metrics** - Get detailed latency and call count breakdowns by Redis command (GET, SET, DEL, etc.)
+* **Extended Redis version support** - Support for Redis 6.x, 7.x, and 8.x including ACL authentication
+* **Flexible deployment** - Deploy as a sidecar, DaemonSet, or standalone Deployment in Kubernetes environments
+
+## Migration overview [#migration-overview]
+
+The migration process follows these steps:
+
+1. Deploy the OTel collector alongside your existing nri-redis integration (side-by-side)
+2. Verify OTel metrics are flowing to New Relic
+3. Update dashboards and alerts to use new metric names
+4. Remove the nri-redis integration
+
+<Callout variant="tip">
+We recommend running both integrations side-by-side for at least one week before removing nri-redis. This allows you to verify data accuracy and update all dependent dashboards and alerts without losing visibility.
+</Callout>
+
+## Metric name mapping [#metric-mapping]
+
+The following table maps nri-redis metric names to their OTel Redis receiver equivalents. Use this mapping when updating NRQL queries, dashboards, and alert conditions.
+
+<table>
+  <thead>
+    <tr>
+      <th>nri-redis metric</th>
+      <th>OTel Redis metric</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>`net.connectedClients`</td>
+      <td>`redis.clients.connected`</td>
+      <td>Direct mapping</td>
+    </tr>
+    <tr>
+      <td>`net.blockedClients`</td>
+      <td>`redis.clients.blocked`</td>
+      <td>Direct mapping</td>
+    </tr>
+    <tr>
+      <td>`db.usedMemoryBytes`</td>
+      <td>`redis.memory.used`</td>
+      <td>Direct mapping (bytes)</td>
+    </tr>
+    <tr>
+      <td>`db.usedMemoryRssBytes`</td>
+      <td>`redis.memory.rss`</td>
+      <td>Direct mapping (bytes)</td>
+    </tr>
+    <tr>
+      <td>`db.peakUsedMemoryBytes`</td>
+      <td>`redis.memory.peak`</td>
+      <td>Direct mapping (bytes)</td>
+    </tr>
+    <tr>
+      <td>`db.memFragmentationRatio`</td>
+      <td>`redis.memory.fragmentation_ratio`</td>
+      <td>Direct mapping</td>
+    </tr>
+    <tr>
+      <td>`db.evictedKeysPerSecond`</td>
+      <td>`rate(redis.keys.evicted)`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`db.expiredKeysPerSecond`</td>
+      <td>`rate(redis.keys.expired)`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`db.keyspaceHitsPerSecond`</td>
+      <td>`rate(redis.keyspace.hits)`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`db.keyspaceMissesPerSecond`</td>
+      <td>`rate(redis.keyspace.misses)`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`net.commandsProcessedPerSecond`</td>
+      <td>`redis.commands`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`net.inputBytesPerSecond`</td>
+      <td>`rate(redis.net.input)`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`net.outputBytesPerSecond`</td>
+      <td>`rate(redis.net.output)`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`net.rejectedConnectionsPerSecond`</td>
+      <td>`rate(redis.connections.rejected)`</td>
+      <td>OTel reports cumulative; use `rate()` in NRQL</td>
+    </tr>
+    <tr>
+      <td>`db.connectedSlaves`</td>
+      <td>`redis.slaves.connected`</td>
+      <td>Direct mapping</td>
+    </tr>
+    <tr>
+      <td>`db.rdbChangesSinceLastSave`</td>
+      <td>`redis.rdb.changes_since_last_save`</td>
+      <td>Direct mapping</td>
+    </tr>
+  </tbody>
+</table>
+
+<Callout variant="important">
+**Rate metrics:** nri-redis reports some metrics as pre-computed per-second rates (e.g., `db.evictedKeysPerSecond`). The OTel Redis receiver reports these as cumulative counters. When querying in NRQL, wrap these metrics with the `rate()` function to get per-second values.
+</Callout>
+
+## Configuration translation [#config-translation]
+
+This section shows how to translate your existing nri-redis configuration to the OTel Redis receiver format.
+
+### nri-redis configuration (before) [#config-before]
+
+Typical nri-redis configuration in `/etc/newrelic-infra/integrations.d/redis-config.yml`:
+
+```yaml
+integrations:
+  - name: nri-redis
+    env:
+      HOSTNAME: localhost
+      PORT: 6379
+      PASSWORD: "your_redis_password"
+      KEYS: '["key1","key2"]'
+      KEYS_LIMIT: 20
+      CONFIG_INVENTORY: true
+      REMOTE_MONITORING: true
+    interval: 15s
+```
+
+### OTel Redis receiver configuration (after) [#config-after]
+
+Equivalent OTel collector configuration in `/etc/nrdot-collector/config.yaml`:
+
+```yaml
+receivers:
+  redis:
+    endpoint: "localhost:6379"
+    collection_interval: 15s
+    password: "${env:REDIS_PASSWORD}"
+    metrics:
+      redis.maxmemory:
+        enabled: true
+      redis.cmd.calls:
+        enabled: true
+      redis.cmd.usec:
+        enabled: true
+      redis.cmd.latency:
+        enabled: true
+
+processors:
+  memory_limiter:
+    check_interval: 60s
+    limit_mib: 100
+  cumulativetodelta: {}
+  resourcedetection:
+    detectors: [system]
+    system:
+      resource_attributes:
+        host.name:
+          enabled: true
+        host.id:
+          enabled: true
+        os.type:
+          enabled: true
+  batch:
+    timeout: 30s
+    send_batch_size: 2048
+    send_batch_max_size: 4096
+
+exporters:
+  otlphttp:
+    endpoint: ${env:NEWRELIC_OTLP_ENDPOINT}
+    headers:
+      api-key: ${env:NEWRELIC_LICENSE_KEY}
+
+service:
+  pipelines:
+    metrics/redis:
+      receivers: [redis]
+      processors: [memory_limiter, resourcedetection, cumulativetodelta, batch]
+      exporters: [otlphttp]
+```
+
+### Configuration field mapping [#field-mapping]
+
+<table>
+  <thead>
+    <tr>
+      <th>nri-redis field</th>
+      <th>OTel Redis receiver field</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>`HOSTNAME` + `PORT`</td>
+      <td>`endpoint`</td>
+      <td>Combined as `host:port`</td>
+    </tr>
+    <tr>
+      <td>`PASSWORD`</td>
+      <td>`password`</td>
+      <td>Use `${env:REDIS_PASSWORD}` for environment variable substitution</td>
+    </tr>
+    <tr>
+      <td>`USERNAME` (Redis 6+)</td>
+      <td>`username`</td>
+      <td>For ACL-based authentication</td>
+    </tr>
+    <tr>
+      <td>`USE_TLS`</td>
+      <td>`tls.insecure: false`</td>
+      <td>Set to `false` to enable TLS</td>
+    </tr>
+    <tr>
+      <td>`TLS_INSECURE_SKIP_VERIFY`</td>
+      <td>`tls.insecure_skip_verify`</td>
+      <td>Direct mapping</td>
+    </tr>
+    <tr>
+      <td>`interval`</td>
+      <td>`collection_interval`</td>
+      <td>Direct mapping (e.g., `15s`)</td>
+    </tr>
+    <tr>
+      <td>`KEYS`</td>
+      <td>Not available</td>
+      <td>Key length metrics not supported by OTel receiver</td>
+    </tr>
+    <tr>
+      <td>`CONFIG_INVENTORY`</td>
+      <td>Not available</td>
+      <td>Inventory data not collected by OTel receiver</td>
+    </tr>
+  </tbody>
+</table>
+
+## Side-by-side operation [#side-by-side]
+
+During migration, run both nri-redis and the OTel collector simultaneously to validate data accuracy before cutting over.
+
+### Step 1: Install the OTel collector [#install-otel]
+
+Install and configure the OTel collector following the [Linux install guide](/docs/infrastructure/host-integrations/host-integrations-list/redis/redis-otel-integration) or [Kubernetes install guide](/docs/infrastructure/host-integrations/host-integrations-list/redis/redis-otel-kubernetes). Keep your existing nri-redis configuration in place.
+
+### Step 2: Validate metrics side-by-side [#validate-metrics]
+
+Run the following NRQL query to compare connected clients reported by both integrations:
+
+```sql
+FROM Metric SELECT
+  latest(redis.clients.connected) AS 'OTel Connected Clients'
+WHERE instrumentation.provider = 'opentelemetry'
+SINCE 10 minutes ago
+COMPARE WITH (
+  FROM RedisSample SELECT latest(net.connectedClients) AS 'nri-redis Connected Clients'
+  SINCE 10 minutes ago
+)
+```
+
+Alternatively, use a simpler comparison query:
+
+```sql
+FROM Metric SELECT latest(redis.clients.connected)
+WHERE instrumentation.provider = 'opentelemetry'
+SINCE 10 minutes ago TIMESERIES
+```
+
+```sql
+FROM RedisSample SELECT latest(net.connectedClients)
+SINCE 10 minutes ago TIMESERIES
+```
+
+Compare the values across several metrics to confirm the OTel data matches nri-redis data.
+
+### Step 3: Remove nri-redis [#remove-nri-redis]
+
+Once you have confirmed data accuracy and updated all dashboards and alerts:
+
+1. Remove the nri-redis configuration file:
+    ```bash
+    sudo rm /etc/newrelic-infra/integrations.d/redis-config.yml
+    ```
+
+2. Restart the infrastructure agent:
+    ```bash
+    sudo systemctl restart newrelic-infra.service
+    ```
+
+## Dashboard query updates [#dashboard-updates]
+
+Update your NRQL queries in dashboards to use the new OTel metric names. Below are common query translations.
+
+### Connected clients [#query-connected-clients]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT latest(net.connectedClients) TIMESERIES
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT latest(redis.clients.connected)
+WHERE instrumentation.provider = 'opentelemetry'
+TIMESERIES
+```
+
+### Memory usage [#query-memory]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT latest(db.usedMemoryBytes) / 1e6 AS 'Used Memory (MB)' TIMESERIES
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT latest(redis.memory.used) / 1e6 AS 'Used Memory (MB)'
+WHERE instrumentation.provider = 'opentelemetry'
+TIMESERIES
+```
+
+### Cache hit ratio [#query-hit-ratio]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT
+  latest(db.keyspaceHitsPerSecond) / (latest(db.keyspaceHitsPerSecond) + latest(db.keyspaceMissesPerSecond)) * 100 AS 'Hit Ratio %'
+TIMESERIES
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT
+  rate(sum(redis.keyspace.hits), 1 second) /
+  (rate(sum(redis.keyspace.hits), 1 second) + rate(sum(redis.keyspace.misses), 1 second)) * 100 AS 'Hit Ratio %'
+WHERE instrumentation.provider = 'opentelemetry'
+TIMESERIES
+```
+
+### Commands per second [#query-commands]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT latest(net.commandsProcessedPerSecond) AS 'Commands/sec' TIMESERIES
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT rate(sum(redis.commands), 1 second) AS 'Commands/sec'
+WHERE instrumentation.provider = 'opentelemetry'
+TIMESERIES
+```
+
+### Evicted keys [#query-evicted]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT latest(db.evictedKeysPerSecond) AS 'Evictions/sec' TIMESERIES
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT rate(sum(redis.keys.evicted), 1 second) AS 'Evictions/sec'
+WHERE instrumentation.provider = 'opentelemetry'
+TIMESERIES
+```
+
+## Alert condition migration [#alert-migration]
+
+Update existing alert conditions to use the new OTel metric names. Below are common alert condition translations.
+
+### High memory usage alert [#alert-memory]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT latest(db.usedMemoryBytes)
+WHERE db.usedMemoryBytes > 1e9
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT latest(redis.memory.used)
+WHERE instrumentation.provider = 'opentelemetry'
+AND redis.memory.used > 1e9
+```
+
+### High connected clients alert [#alert-clients]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT latest(net.connectedClients)
+WHERE net.connectedClients > 10000
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT latest(redis.clients.connected)
+WHERE instrumentation.provider = 'opentelemetry'
+AND redis.clients.connected > 10000
+```
+
+### Low cache hit ratio alert [#alert-hit-ratio]
+
+**Before (nri-redis):**
+```sql
+FROM RedisSample SELECT
+  latest(db.keyspaceHitsPerSecond) / (latest(db.keyspaceHitsPerSecond) + latest(db.keyspaceMissesPerSecond)) * 100
+```
+
+**After (OTel):**
+```sql
+FROM Metric SELECT
+  rate(sum(redis.keyspace.hits), 1 second) /
+  (rate(sum(redis.keyspace.hits), 1 second) + rate(sum(redis.keyspace.misses), 1 second)) * 100
+WHERE instrumentation.provider = 'opentelemetry'
+```
+
+<Callout variant="tip">
+When creating new alert conditions, consider adding `AND instrumentation.provider = 'opentelemetry'` to your NRQL queries. This ensures the alert only fires on OTel data and avoids conflicts with any remaining nri-redis data during the migration period.
+</Callout>
+
+## Known differences and limitations [#known-differences]
+
+Be aware of the following differences between nri-redis and the OTel Redis receiver:
+
+<table>
+  <thead>
+    <tr>
+      <th>Feature</th>
+      <th>nri-redis</th>
+      <th>OTel Redis receiver</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Key length metrics</td>
+      <td>Supported (`KEYS` config option)</td>
+      <td>Not supported</td>
+    </tr>
+    <tr>
+      <td>Inventory data</td>
+      <td>Collected (Redis CONFIG)</td>
+      <td>Not collected</td>
+    </tr>
+    <tr>
+      <td>Rate metrics</td>
+      <td>Pre-computed per-second rates</td>
+      <td>Cumulative counters (use `rate()` in NRQL)</td>
+    </tr>
+    <tr>
+      <td>Event type</td>
+      <td>`RedisSample`</td>
+      <td>`Metric` (with `instrumentation.provider = 'opentelemetry'`)</td>
+    </tr>
+    <tr>
+      <td>Per-command metrics</td>
+      <td>Not supported</td>
+      <td>Supported (`redis.cmd.*`)</td>
+    </tr>
+    <tr>
+      <td>Redis versions</td>
+      <td>3.0 to 7.0</td>
+      <td>6.x, 7.x, 8.x</td>
+    </tr>
+    <tr>
+      <td>Renamed commands</td>
+      <td>Configurable (`RENAMED_COMMANDS`)</td>
+      <td>Not supported</td>
+    </tr>
+    <tr>
+      <td>Entity type</td>
+      <td>`REDIS_INSTANCE`</td>
+      <td>`REDIS_INSTANCE` (same entity type in Entity Explorer)</td>
+    </tr>
+  </tbody>
+</table>
+
+## Rollback procedure [#rollback]
+
+If you need to revert to nri-redis after removing it:
+
+1. Restore the nri-redis configuration:
+
+    ```bash
+    sudo cp /etc/newrelic-infra/integrations.d/redis-config.yml.backup \
+      /etc/newrelic-infra/integrations.d/redis-config.yml
+    ```
+
+    If you did not keep a backup, recreate the configuration file following the [nri-redis installation guide](/docs/infrastructure/host-integrations/host-integrations-list/redis/redis-integration).
+
+2. Restart the infrastructure agent:
+
+    ```bash
+    sudo systemctl restart newrelic-infra.service
+    ```
+
+3. Stop the OTel collector (if you want to fully revert):
+
+    ```bash
+    sudo systemctl stop nrdot-collector.service
+    sudo systemctl disable nrdot-collector.service
+    ```
+
+4. Revert dashboard queries and alert conditions to their original nri-redis versions.
+
+<Callout variant="tip">
+Keep your OTel collector configuration file as a backup even after reverting. This makes it easy to re-attempt the migration later without repeating the configuration work.
+</Callout>

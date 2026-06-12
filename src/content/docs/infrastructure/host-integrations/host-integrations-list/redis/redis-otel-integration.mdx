@@ -1,0 +1,662 @@
+---
+title: Monitor Redis with OpenTelemetry on Linux
+tags:
+  - OpenTelemetry
+  - Redis
+  - Integrations
+  - Self-hosted
+metaDescription: "Install and configure the OpenTelemetry Collector to monitor self-hosted Redis instances on Linux servers and send data to New Relic."
+freshnessValidatedDate: never
+---
+
+{/* TODO: Gate page visibility behind feature flag ohai.redis.otel_integration */}
+
+Monitor your self-hosted Redis instances by installing the OpenTelemetry Collector on Linux servers or virtual machines. This integration uses the [Redis receiver](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/redisreceiver) from opentelemetry-collector-contrib to collect Redis metrics and send them to New Relic.
+
+You can choose between two collector options:
+* **NRDOT:** New Relic Distribution of OpenTelemetry (recommended)
+* **OTel Collector Contrib:** Standard OpenTelemetry Collector with community-contributed components
+
+## Installation options [#installation-options]
+
+Choose the collector distribution that matches your needs:
+
+<Tabs>
+  <TabsBar>
+    <TabsBarItem id="nrdot">NRDOT Collector</TabsBarItem>
+    <TabsBarItem id="otel-contrib">OTel Collector Contrib</TabsBarItem>
+  </TabsBar>
+
+  <TabsPages>
+    <TabsPageItem id="nrdot">
+
+<Steps>
+
+<Step>
+
+### Before you begin [#prereq-nrdot]
+
+Before configuring Redis monitoring with NRDOT, ensure you have:
+
+**NRDOT collector installed:**
+* You must have NRDOT collector installed and running as a systemd service on your host
+* If not installed, follow the [official NRDOT installation guide](/docs/opentelemetry/nrdot/nrdot-collector/) to install the collector using the package manager (DEB/RPM) which sets up the systemd service automatically
+
+**Required access privileges:**
+* Your New Relic <InlinePopover type="licenseKey"/>
+* Root or sudo privileges on the host machine
+* Redis credentials (if authentication is enabled)
+
+**System requirements:**
+* **Redis version 6.x, 7.x, or 8.x** - Standalone, cluster, or sentinel deployments
+* **Network connectivity** - Outbound HTTPS (port 443) to New Relic's [OTLP ingest endpoint](/docs/opentelemetry/best-practices/opentelemetry-otlp)
+* **Redis connectivity** - The collector must be able to reach Redis on its configured port (default: 6379)
+
+</Step>
+
+<Step>
+
+### Configure Redis monitoring [#configure-redis-nrdot]
+
+Once the NRDOT collector is installed, replace the collector's default configuration file with the Redis monitoring configuration.
+
+The configuration file is located at: `/etc/nrdot-collector/config.yaml`
+
+<Callout variant="tip">
+**Backup your default configuration:** Before modifying the configuration file, create a backup copy to preserve the default settings:
+```bash
+sudo cp /etc/nrdot-collector/config.yaml /etc/nrdot-collector/config.yaml.backup
+```
+</Callout>
+
+To configure the collector:
+
+1. Open the configuration file with a text editor using root or sudo privileges:
+
+    ```bash
+    sudo nano /etc/nrdot-collector/config.yaml
+    ```
+
+2. Delete all existing content and replace it with the following configuration for Redis monitoring:
+
+<Callout variant="important">
+Replace the `endpoint` value with your Redis instance address and port. If your Redis instance requires authentication, uncomment and configure the `password` field.
+</Callout>
+
+```yaml
+receivers:
+  redis:
+    endpoint: "localhost:6379"
+    collection_interval: 15s
+    # username: ""  # For Redis 6+ ACL authentication
+    # password: "${env:REDIS_PASSWORD}"
+    tls:
+      insecure: true
+    metrics:
+      redis.maxmemory:
+        enabled: true
+      redis.cmd.calls:
+        enabled: true
+      redis.cmd.usec:
+        enabled: true
+      redis.cmd.latency:
+        enabled: true
+
+processors:
+  memory_limiter:
+    check_interval: 60s
+    limit_mib: ${env:NEW_RELIC_MEMORY_LIMIT_MIB:-100}
+  cumulativetodelta: {}
+  resourcedetection:
+    detectors: [system]
+    system:
+      resource_attributes:
+        host.name:
+          enabled: true
+        host.id:
+          enabled: true
+        os.type:
+          enabled: true
+  batch:
+    timeout: 30s
+    send_batch_size: 2048
+    send_batch_max_size: 4096
+  attributes/cardinality_reduction:
+    actions:
+      - key: process.pid
+        action: delete
+      - key: process.parent_pid
+        action: delete
+  transform/metadata_nullify:
+    metric_statements:
+      - context: metric
+        statements:
+          - set(description, "")
+          - set(unit, "")
+
+exporters:
+  otlphttp:
+    endpoint: ${env:NEWRELIC_OTLP_ENDPOINT}
+    headers:
+      api-key: ${env:NEWRELIC_LICENSE_KEY}
+    compression: gzip
+    timeout: 30s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+service:
+  pipelines:
+    metrics/redis:
+      receivers: [redis]
+      processors: [memory_limiter, resourcedetection, attributes/cardinality_reduction, cumulativetodelta, transform/metadata_nullify, batch]
+      exporters: [otlphttp]
+```
+
+3. *(Optional)* For Redis with password authentication, set the password using an environment variable:
+
+    ```yaml
+    receivers:
+      redis:
+        endpoint: "localhost:6379"
+        password: "${env:REDIS_PASSWORD}"
+        collection_interval: 15s
+    ```
+
+4. *(Optional)* For Redis 6+ with ACL authentication (username and password):
+
+    ```yaml
+    receivers:
+      redis:
+        endpoint: "localhost:6379"
+        username: "your_redis_username"
+        password: "${env:REDIS_PASSWORD}"
+        collection_interval: 15s
+    ```
+
+5. *(Optional)* For Redis with TLS enabled:
+
+    ```yaml
+    receivers:
+      redis:
+        endpoint: "localhost:6379"
+        password: "${env:REDIS_PASSWORD}"
+        tls:
+          insecure: false
+          ca_file: /path/to/ca.pem
+          cert_file: /path/to/cert.pem
+          key_file: /path/to/key.pem
+        collection_interval: 15s
+    ```
+
+6. Save the configuration file.
+
+7. Set the environment variables:
+
+    Create a systemd override directory:
+
+    ```bash
+    sudo mkdir -p /etc/systemd/system/nrdot-collector.service.d
+    ```
+
+    Create the environment configuration file:
+
+    ```bash
+    cat <<EOF | sudo tee /etc/systemd/system/nrdot-collector.service.d/environment.conf
+    [Service]
+    Environment="NEWRELIC_OTLP_ENDPOINT=https://otlp.nr-data.net:4318"
+    Environment="NEWRELIC_LICENSE_KEY=YOUR_LICENSE_KEY_HERE"
+    Environment="NEW_RELIC_MEMORY_LIMIT_MIB=100"
+    Environment="REDIS_PASSWORD=YOUR_REDIS_PASSWORD_HERE"
+    EOF
+    ```
+
+    Update the configuration with your values:
+    * Replace `https://otlp.nr-data.net:4318` with your region's endpoint (use `https://otlp.eu01.nr-data.net:4318` for EU accounts)
+    * Replace `YOUR_LICENSE_KEY_HERE` with your actual New Relic license key
+    * Replace `YOUR_REDIS_PASSWORD_HERE` with your Redis password (remove this line if no authentication is required)
+
+8. Restart the NRDOT collector to apply changes:
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl restart nrdot-collector.service
+    ```
+
+</Step>
+
+<Step>
+
+### Verify data collection [#verify-nrdot]
+
+Verify that the NRDOT collector is running and collecting data without errors:
+
+1. Check the collector service status:
+
+    ```bash
+    sudo systemctl status nrdot-collector.service
+    ```
+
+2. Monitor the collector logs for any errors:
+
+    ```bash
+    sudo journalctl -u nrdot-collector.service -f
+    ```
+
+    Look for successful connections to Redis and New Relic.
+
+3. Run an NRQL query in New Relic to confirm data is arriving:
+
+    ```sql
+    FROM Metric SELECT count(*)
+    WHERE metricName LIKE 'redis.%'
+    AND instrumentation.provider = 'opentelemetry'
+    SINCE 5 minutes ago
+    ```
+
+4. Navigate to **All Entities** in New Relic and look for your Redis instance under the **Redis** entity type.
+
+</Step>
+
+</Steps>
+
+    </TabsPageItem>
+
+    <TabsPageItem id="otel-contrib">
+
+<Steps>
+
+<Step>
+
+### Before you begin [#prereq-otel]
+
+Before configuring the OTel Collector Contrib, ensure you have:
+
+**Required access privileges:**
+* Your New Relic <InlinePopover type="licenseKey"/>
+* Root or sudo privileges on the host machine
+* Redis credentials (if authentication is enabled)
+
+**System requirements:**
+* **Redis version 6.x, 7.x, or 8.x** - Standalone, cluster, or sentinel deployments
+* **Network connectivity** - Outbound HTTPS (port 443) to New Relic's [OTLP ingest endpoint](/docs/opentelemetry/best-practices/opentelemetry-otlp)
+* **Redis connectivity** - The collector must be able to reach Redis on its configured port (default: 6379)
+
+<Callout variant="important">
+You must have [OpenTelemetry Collector Contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/latest) installed on your host before proceeding. We recommend installing via official packages (.deb or .rpm) to ensure the systemd service unit is created correctly.
+</Callout>
+
+</Step>
+
+<Step>
+
+### Configure Redis monitoring [#configure-redis-otel]
+
+Once the OTel Collector Contrib is installed, replace the collector's default configuration file with the Redis monitoring configuration.
+
+The configuration file is located at: `/etc/otelcol-contrib/config.yaml`
+
+<Callout variant="tip">
+**Backup your default configuration:** Before modifying the configuration file, create a backup copy to preserve the default settings:
+```bash
+sudo cp /etc/otelcol-contrib/config.yaml /etc/otelcol-contrib/config.yaml.backup
+```
+</Callout>
+
+To configure the collector:
+
+1. Open the configuration file with a text editor using root or sudo privileges:
+
+    ```bash
+    sudo nano /etc/otelcol-contrib/config.yaml
+    ```
+
+2. Delete all existing content and replace it with the following configuration for Redis monitoring:
+
+<Callout variant="important">
+Replace the `endpoint` value with your Redis instance address and port. If your Redis instance requires authentication, uncomment and configure the `password` field.
+</Callout>
+
+```yaml
+receivers:
+  redis:
+    endpoint: "localhost:6379"
+    collection_interval: 15s
+    # username: ""  # For Redis 6+ ACL authentication
+    # password: "${env:REDIS_PASSWORD}"
+    tls:
+      insecure: true
+    metrics:
+      redis.maxmemory:
+        enabled: true
+      redis.cmd.calls:
+        enabled: true
+      redis.cmd.usec:
+        enabled: true
+      redis.cmd.latency:
+        enabled: true
+
+processors:
+  memory_limiter:
+    check_interval: 60s
+    limit_mib: ${env:NEW_RELIC_MEMORY_LIMIT_MIB:-100}
+  cumulativetodelta: {}
+  resourcedetection:
+    detectors: [system]
+    system:
+      resource_attributes:
+        host.name:
+          enabled: true
+        host.id:
+          enabled: true
+        os.type:
+          enabled: true
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+  attributes/cardinality_reduction:
+    actions:
+      - key: process.pid
+        action: delete
+      - key: process.parent_pid
+        action: delete
+  transform/metadata_nullify:
+    metric_statements:
+      - context: metric
+        statements:
+          - set(description, "")
+          - set(unit, "")
+
+exporters:
+  otlphttp:
+    endpoint: ${env:NEWRELIC_OTLP_ENDPOINT}
+    headers:
+      api-key: ${env:NEWRELIC_LICENSE_KEY}
+
+service:
+  pipelines:
+    metrics/redis:
+      receivers: [redis]
+      processors: [memory_limiter, resourcedetection, attributes/cardinality_reduction, cumulativetodelta, transform/metadata_nullify, batch]
+      exporters: [otlphttp]
+```
+
+3. *(Optional)* For Redis with password authentication, set the password using an environment variable:
+
+    ```yaml
+    receivers:
+      redis:
+        endpoint: "localhost:6379"
+        password: "${env:REDIS_PASSWORD}"
+        collection_interval: 15s
+    ```
+
+4. *(Optional)* For Redis 6+ with ACL authentication (username and password):
+
+    ```yaml
+    receivers:
+      redis:
+        endpoint: "localhost:6379"
+        username: "your_redis_username"
+        password: "${env:REDIS_PASSWORD}"
+        collection_interval: 15s
+    ```
+
+5. *(Optional)* For Redis with TLS enabled:
+
+    ```yaml
+    receivers:
+      redis:
+        endpoint: "localhost:6379"
+        password: "${env:REDIS_PASSWORD}"
+        tls:
+          insecure: false
+          ca_file: /path/to/ca.pem
+          cert_file: /path/to/cert.pem
+          key_file: /path/to/key.pem
+        collection_interval: 15s
+    ```
+
+6. Save the configuration file.
+
+7. Set the environment variables:
+
+    Create a systemd override directory:
+
+    ```bash
+    sudo mkdir -p /etc/systemd/system/otelcol-contrib.service.d
+    ```
+
+    Create the environment configuration file:
+
+    ```bash
+    cat <<EOF | sudo tee /etc/systemd/system/otelcol-contrib.service.d/environment.conf
+    [Service]
+    Environment="NEWRELIC_OTLP_ENDPOINT=https://otlp.nr-data.net:4318"
+    Environment="NEWRELIC_LICENSE_KEY=YOUR_LICENSE_KEY_HERE"
+    Environment="NEW_RELIC_MEMORY_LIMIT_MIB=100"
+    Environment="REDIS_PASSWORD=YOUR_REDIS_PASSWORD_HERE"
+    EOF
+    ```
+
+    Update the configuration with your values:
+    * Replace `https://otlp.nr-data.net:4318` with your region's endpoint (use `https://otlp.eu01.nr-data.net:4318` for EU accounts)
+    * Replace `YOUR_LICENSE_KEY_HERE` with your actual New Relic license key
+    * Replace `YOUR_REDIS_PASSWORD_HERE` with your Redis password (remove this line if no authentication is required)
+
+8. Restart the OTel Collector Contrib to apply changes:
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl restart otelcol-contrib.service
+    ```
+
+</Step>
+
+<Step>
+
+### Verify data collection [#verify-otel]
+
+Verify that the OTel Collector Contrib is running and collecting data without errors:
+
+1. Check the collector service status:
+
+    ```bash
+    sudo systemctl status otelcol-contrib.service
+    ```
+
+2. Monitor the collector logs for any errors:
+
+    ```bash
+    sudo journalctl -u otelcol-contrib.service -f
+    ```
+
+    Look for successful connections to Redis and New Relic.
+
+3. Run an NRQL query in New Relic to confirm data is arriving:
+
+    ```sql
+    FROM Metric SELECT count(*)
+    WHERE metricName LIKE 'redis.%'
+    AND instrumentation.provider = 'opentelemetry'
+    SINCE 5 minutes ago
+    ```
+
+4. Navigate to **All Entities** in New Relic and look for your Redis instance under the **Redis** entity type.
+
+</Step>
+
+</Steps>
+
+    </TabsPageItem>
+
+  </TabsPages>
+</Tabs>
+
+## Optional metrics configuration [#optional-metrics]
+
+The Redis receiver collects a core set of metrics by default. You can enable additional metrics for deeper visibility:
+
+<CollapserGroup>
+
+  <Collapser id="command-metrics" title="Per-command metrics (redis.cmd.*)">
+
+Enable per-command metrics to track individual Redis command performance:
+
+```yaml
+receivers:
+  redis:
+    endpoint: "localhost:6379"
+    collection_interval: 15s
+    metrics:
+      redis.cmd.calls:
+        enabled: true
+      redis.cmd.usec:
+        enabled: true
+      redis.cmd.latency:
+        enabled: true
+```
+
+These metrics provide:
+* `redis.cmd.calls` - Number of calls per command
+* `redis.cmd.usec` - Total CPU time consumed per command (microseconds)
+* `redis.cmd.latency` - Average latency per command
+
+  </Collapser>
+
+  <Collapser id="memory-metrics" title="Extended memory metrics">
+
+Enable extended memory metrics for capacity planning:
+
+```yaml
+receivers:
+  redis:
+    endpoint: "localhost:6379"
+    collection_interval: 15s
+    metrics:
+      redis.maxmemory:
+        enabled: true
+```
+
+  </Collapser>
+
+  <Collapser id="collection-interval" title="Adjusting collection interval">
+
+The default collection interval is 15 seconds. For higher-resolution monitoring, you can reduce it to 5 seconds:
+
+```yaml
+receivers:
+  redis:
+    endpoint: "localhost:6379"
+    collection_interval: 5s
+```
+
+<Callout variant="caution">
+Reducing the collection interval increases data volume and may impact Redis performance on heavily loaded instances.
+</Callout>
+
+  </Collapser>
+
+</CollapserGroup>
+
+## Multi-instance monitoring [#multi-instance]
+
+To monitor multiple Redis instances from a single collector, define multiple Redis receivers:
+
+```yaml
+receivers:
+  redis/primary:
+    endpoint: "localhost:6379"
+    collection_interval: 15s
+    password: "${env:REDIS_PRIMARY_PASSWORD}"
+  redis/replica:
+    endpoint: "localhost:6380"
+    collection_interval: 15s
+    password: "${env:REDIS_REPLICA_PASSWORD}"
+
+service:
+  pipelines:
+    metrics/redis:
+      receivers: [redis/primary, redis/replica]
+      processors: [memory_limiter, resourcedetection, cumulativetodelta, batch]
+      exporters: [otlphttp]
+```
+
+## Troubleshooting [#troubleshooting]
+
+<CollapserGroup>
+
+  <Collapser id="no-data" title="No data appearing in New Relic">
+
+If no Redis data appears in New Relic:
+
+1. Verify the collector is running:
+    ```bash
+    sudo systemctl status nrdot-collector.service
+    ```
+
+2. Check collector logs for connection errors:
+    ```bash
+    sudo journalctl -u nrdot-collector.service --no-pager | grep -i "redis\|error"
+    ```
+
+3. Test Redis connectivity from the collector host:
+    ```bash
+    redis-cli -h localhost -p 6379 ping
+    ```
+
+4. Verify your license key and OTLP endpoint are correct in the environment configuration.
+
+  </Collapser>
+
+  <Collapser id="auth-errors" title="Authentication errors">
+
+If you see authentication errors in the collector logs:
+
+1. Confirm the Redis password is correct:
+    ```bash
+    redis-cli -h localhost -p 6379 -a YOUR_PASSWORD ping
+    ```
+
+2. For Redis 6+ with ACL, verify both username and password:
+    ```bash
+    redis-cli -h localhost -p 6379 --user YOUR_USERNAME -a YOUR_PASSWORD ping
+    ```
+
+3. Ensure the environment variable `REDIS_PASSWORD` is set correctly in the systemd override.
+
+  </Collapser>
+
+  <Collapser id="tls-errors" title="TLS connection errors">
+
+If you see TLS-related errors:
+
+1. Verify the certificate paths are correct and the files are readable by the collector service user.
+2. Ensure the CA certificate matches the one used by your Redis server.
+3. For testing, you can temporarily set `insecure_skip_verify: true` (not recommended for production):
+    ```yaml
+    tls:
+      insecure_skip_verify: true
+    ```
+
+  </Collapser>
+
+  <Collapser id="high-cardinality" title="High cardinality from per-command metrics">
+
+If enabling `redis.cmd.*` metrics creates too many time series:
+
+1. Consider disabling per-command metrics if you have many unique commands.
+2. Use the `filter` processor to limit which commands are tracked:
+    ```yaml
+    processors:
+      filter/redis_commands:
+        metrics:
+          datapoint:
+            - 'attributes["redis.cmd"] == "GET" or attributes["redis.cmd"] == "SET" or attributes["redis.cmd"] == "DEL"'
+    ```
+
+  </Collapser>
+
+</CollapserGroup>

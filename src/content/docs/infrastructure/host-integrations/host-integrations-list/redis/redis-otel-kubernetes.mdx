@@ -1,0 +1,724 @@
+---
+title: Monitor Redis on Kubernetes with OpenTelemetry
+tags:
+  - OpenTelemetry
+  - Redis
+  - Integrations
+  - Kubernetes
+metaDescription: "Install and configure the OpenTelemetry Collector to monitor Redis instances running in Kubernetes and send data to New Relic."
+freshnessValidatedDate: never
+---
+
+{/* TODO: Gate page visibility behind feature flag ohai.redis.otel_integration */}
+
+Monitor your Redis instances in Kubernetes by deploying the OpenTelemetry Collector. This integration uses the [Redis receiver](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/redisreceiver) to collect Redis metrics and send them to New Relic.
+
+You can choose between two collector options:
+* **NRDOT:** New Relic Distribution of OpenTelemetry (recommended)
+* **OTel Collector Contrib:** Standard OpenTelemetry Collector with community-contributed components
+
+## Installation options [#installation-options]
+
+Choose the collector distribution that matches your needs:
+
+<Tabs>
+  <TabsBar>
+    <TabsBarItem id="nrdot">NRDOT Collector</TabsBarItem>
+    <TabsBarItem id="otel-contrib">OTel Collector Contrib</TabsBarItem>
+  </TabsBar>
+
+  <TabsPages>
+    <TabsPageItem id="nrdot">
+
+<Steps>
+
+<Step>
+
+### Before you begin [#prereq-nrdot]
+
+Before deploying the NRDOT collector on Kubernetes, ensure you have:
+
+**Required access privileges:**
+* Your New Relic <InlinePopover type="licenseKey"/>
+* `kubectl` access to your Kubernetes cluster
+* [Helm 3.0 or higher](https://helm.sh/docs/intro/install/) installed on your system
+* Redis credentials (if authentication is enabled)
+
+**System requirements:**
+* **Redis version 6.x, 7.x, or 8.x** - Standalone, cluster, or sentinel deployments
+* **Kubernetes cluster** - A running Kubernetes cluster where Redis is deployed
+* **Network connectivity** - Outbound HTTPS (port 443) to New Relic's [OTLP ingest endpoint](/docs/opentelemetry/best-practices/opentelemetry-otlp)
+
+</Step>
+
+<Step>
+
+### Create Kubernetes secret for credentials [#create-secret-nrdot]
+
+Create a Kubernetes secret to store your New Relic credentials and Redis password securely:
+
+1. Create the namespace (if it does not already exist):
+
+    ```bash
+    kubectl create namespace newrelic
+    ```
+
+2. Create the secret:
+
+    ```bash
+    kubectl create secret generic newrelic-redis-credentials \
+      --from-literal=NEWRELIC_LICENSE_KEY=YOUR_LICENSE_KEY_HERE \
+      --from-literal=NEWRELIC_OTLP_ENDPOINT=https://otlp.nr-data.net:4318 \
+      --from-literal=NEW_RELIC_MEMORY_LIMIT_MIB=100 \
+      --from-literal=REDIS_PASSWORD=YOUR_REDIS_PASSWORD_HERE \
+      -n newrelic
+    ```
+
+    Update the values:
+    * Replace `YOUR_LICENSE_KEY_HERE` with your actual New Relic license key
+    * Replace `https://otlp.nr-data.net:4318` with your region's endpoint (use `https://otlp.eu01.nr-data.net:4318` for EU accounts)
+    * Replace `YOUR_REDIS_PASSWORD_HERE` with your Redis password (use an empty string if no authentication is required)
+
+</Step>
+
+<Step>
+
+### Configure Redis monitoring [#configure-redis-nrdot]
+
+Create a `values.yaml` file for NRDOT Collector Redis monitoring.
+
+**Choose your deployment mode:**
+* **Deployment** (recommended for standalone Redis or when you know the Redis service endpoint) - Single collector pod monitors Redis via service DNS
+* **DaemonSet** (recommended for Redis pods distributed across nodes) - One collector pod per node, useful when Redis pods run on specific nodes
+
+<CollapserGroup>
+
+  <Collapser id="nrdot-deployment-values" title="Deployment mode values.yaml (recommended)">
+
+```yaml
+mode: deployment
+
+image:
+  repository: newrelic/nrdot-collector
+  tag: latest
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+extraEnvs:
+  - name: NEWRELIC_LICENSE_KEY
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEWRELIC_LICENSE_KEY
+  - name: NEWRELIC_OTLP_ENDPOINT
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEWRELIC_OTLP_ENDPOINT
+  - name: NEW_RELIC_MEMORY_LIMIT_MIB
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEW_RELIC_MEMORY_LIMIT_MIB
+  - name: REDIS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: REDIS_PASSWORD
+
+ports: {}
+
+config:
+  receivers:
+    redis:
+      endpoint: "redis-master.default.svc.cluster.local:6379"
+      collection_interval: 15s
+      password: "${env:REDIS_PASSWORD}"
+      metrics:
+        redis.maxmemory:
+          enabled: true
+        redis.cmd.calls:
+          enabled: true
+        redis.cmd.usec:
+          enabled: true
+        redis.cmd.latency:
+          enabled: true
+
+  processors:
+    memory_limiter:
+      check_interval: 60s
+      limit_mib: ${env:NEW_RELIC_MEMORY_LIMIT_MIB}
+    cumulativetodelta: {}
+    resourcedetection:
+      detectors: [env]
+    batch:
+      timeout: 30s
+      send_batch_size: 2048
+      send_batch_max_size: 4096
+    attributes/cardinality_reduction:
+      actions:
+        - key: process.pid
+          action: delete
+        - key: process.parent_pid
+          action: delete
+        - key: k8s.pod.uid
+          action: delete
+    transform/metadata_nullify:
+      metric_statements:
+        - context: metric
+          statements:
+            - set(description, "")
+            - set(unit, "")
+
+  exporters:
+    otlphttp:
+      endpoint: "${env:NEWRELIC_OTLP_ENDPOINT}"
+      headers:
+        api-key: "${env:NEWRELIC_LICENSE_KEY}"
+      compression: gzip
+      timeout: 30s
+      retry_on_failure:
+        enabled: true
+        initial_interval: 5s
+        max_interval: 30s
+        max_elapsed_time: 300s
+
+  service:
+    pipelines:
+      metrics/redis:
+        receivers: [redis]
+        processors: [memory_limiter, resourcedetection, attributes/cardinality_reduction, cumulativetodelta, transform/metadata_nullify, batch]
+        exporters: [otlphttp]
+```
+
+  </Collapser>
+
+  <Collapser id="nrdot-daemonset-values" title="DaemonSet mode values.yaml">
+
+```yaml
+mode: daemonset
+
+image:
+  repository: newrelic/nrdot-collector
+  tag: latest
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+extraEnvs:
+  - name: NEWRELIC_LICENSE_KEY
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEWRELIC_LICENSE_KEY
+  - name: NEWRELIC_OTLP_ENDPOINT
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEWRELIC_OTLP_ENDPOINT
+  - name: NEW_RELIC_MEMORY_LIMIT_MIB
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEW_RELIC_MEMORY_LIMIT_MIB
+  - name: REDIS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: REDIS_PASSWORD
+  - name: NODE_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.hostIP
+
+ports: {}
+
+config:
+  receivers:
+    redis:
+      endpoint: "${env:NODE_IP}:6379"
+      collection_interval: 15s
+      password: "${env:REDIS_PASSWORD}"
+      metrics:
+        redis.maxmemory:
+          enabled: true
+        redis.cmd.calls:
+          enabled: true
+        redis.cmd.usec:
+          enabled: true
+        redis.cmd.latency:
+          enabled: true
+
+  processors:
+    memory_limiter:
+      check_interval: 60s
+      limit_mib: ${env:NEW_RELIC_MEMORY_LIMIT_MIB}
+    cumulativetodelta: {}
+    resourcedetection:
+      detectors: [env]
+    batch:
+      timeout: 30s
+      send_batch_size: 2048
+      send_batch_max_size: 4096
+    attributes/cardinality_reduction:
+      actions:
+        - key: process.pid
+          action: delete
+        - key: process.parent_pid
+          action: delete
+        - key: k8s.pod.uid
+          action: delete
+    transform/metadata_nullify:
+      metric_statements:
+        - context: metric
+          statements:
+            - set(description, "")
+            - set(unit, "")
+
+  exporters:
+    otlphttp:
+      endpoint: "${env:NEWRELIC_OTLP_ENDPOINT}"
+      headers:
+        api-key: "${env:NEWRELIC_LICENSE_KEY}"
+      compression: gzip
+      timeout: 30s
+      retry_on_failure:
+        enabled: true
+        initial_interval: 5s
+        max_interval: 30s
+        max_elapsed_time: 300s
+
+  service:
+    pipelines:
+      metrics/redis:
+        receivers: [redis]
+        processors: [memory_limiter, resourcedetection, attributes/cardinality_reduction, cumulativetodelta, transform/metadata_nullify, batch]
+        exporters: [otlphttp]
+```
+
+  </Collapser>
+
+</CollapserGroup>
+
+<Callout variant="important">
+**Required changes:**
+* **Redis endpoint** - Replace `redis-master.default.svc.cluster.local:6379` with the Kubernetes service address of your Redis instance (format: `<service-name>.<namespace>.svc.cluster.local:<port>`)
+* **Password** - If your Redis instance does not require authentication, remove the `password` field from the receiver configuration
+</Callout>
+
+</Step>
+
+<Step>
+
+### Install with Helm [#nrdot-helm-install]
+
+Install the NRDOT Collector using Helm with your `values.yaml` configuration:
+
+```bash
+helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+helm repo update
+helm upgrade --install redis-nrdot-collector open-telemetry/opentelemetry-collector \
+  --namespace newrelic \
+  --create-namespace \
+  -f values.yaml
+```
+
+</Step>
+
+<Step>
+
+### Verify deployment and data collection [#nrdot-verify]
+
+Verify that the NRDOT collector is running and collecting Redis data:
+
+1. Check that the collector pods are running:
+
+    ```bash
+    kubectl get pods -n newrelic -l app.kubernetes.io/name=opentelemetry-collector --watch
+    ```
+
+2. Check the collector logs for any errors:
+
+    ```bash
+    kubectl logs -n newrelic -l app.kubernetes.io/name=opentelemetry-collector -f
+    ```
+
+    Look for successful connections to Redis and New Relic.
+
+3. Run an NRQL query in New Relic to confirm data is arriving:
+
+    ```sql
+    FROM Metric SELECT count(*)
+    WHERE metricName LIKE 'redis.%'
+    AND instrumentation.provider = 'opentelemetry'
+    SINCE 5 minutes ago
+    ```
+
+4. Navigate to **All Entities** in New Relic and look for your Redis instance under the **Redis** entity type.
+
+</Step>
+
+</Steps>
+
+    </TabsPageItem>
+
+    <TabsPageItem id="otel-contrib">
+
+<Steps>
+
+<Step>
+
+### Before you begin [#prereq-otel]
+
+Before deploying the OTel Collector Contrib on Kubernetes, ensure you have:
+
+**Required access privileges:**
+* Your New Relic <InlinePopover type="licenseKey"/>
+* `kubectl` access to your Kubernetes cluster
+* [Helm 3.0 or higher](https://helm.sh/docs/intro/install/) installed on your system
+* Redis credentials (if authentication is enabled)
+
+**System requirements:**
+* **Redis version 6.x, 7.x, or 8.x** - Standalone, cluster, or sentinel deployments
+* **Kubernetes cluster** - A running Kubernetes cluster where Redis is deployed
+* **Network connectivity** - Outbound HTTPS (port 443) to New Relic's [OTLP ingest endpoint](/docs/opentelemetry/best-practices/opentelemetry-otlp)
+
+</Step>
+
+<Step>
+
+### Create Kubernetes secret for credentials [#create-secret-otel]
+
+Create a Kubernetes secret to store your New Relic credentials and Redis password securely:
+
+1. Create the namespace (if it does not already exist):
+
+    ```bash
+    kubectl create namespace newrelic
+    ```
+
+2. Create the secret:
+
+    ```bash
+    kubectl create secret generic newrelic-redis-credentials \
+      --from-literal=NEWRELIC_LICENSE_KEY=YOUR_LICENSE_KEY_HERE \
+      --from-literal=NEWRELIC_OTLP_ENDPOINT=https://otlp.nr-data.net:4318 \
+      --from-literal=NEW_RELIC_MEMORY_LIMIT_MIB=100 \
+      --from-literal=REDIS_PASSWORD=YOUR_REDIS_PASSWORD_HERE \
+      -n newrelic
+    ```
+
+    Update the values:
+    * Replace `YOUR_LICENSE_KEY_HERE` with your actual New Relic license key
+    * Replace `https://otlp.nr-data.net:4318` with your region's endpoint (use `https://otlp.eu01.nr-data.net:4318` for EU accounts)
+    * Replace `YOUR_REDIS_PASSWORD_HERE` with your Redis password (use an empty string if no authentication is required)
+
+</Step>
+
+<Step>
+
+### Configure Redis monitoring [#configure-redis-otel]
+
+Create a `values.yaml` file to configure the OpenTelemetry Collector for Redis monitoring:
+
+```yaml
+mode: deployment
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+  pullPolicy: IfNotPresent
+
+command:
+  name: otelcol-contrib
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+extraEnvs:
+  - name: NEWRELIC_LICENSE_KEY
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEWRELIC_LICENSE_KEY
+  - name: NEWRELIC_OTLP_ENDPOINT
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEWRELIC_OTLP_ENDPOINT
+  - name: NEW_RELIC_MEMORY_LIMIT_MIB
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: NEW_RELIC_MEMORY_LIMIT_MIB
+  - name: REDIS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: newrelic-redis-credentials
+        key: REDIS_PASSWORD
+
+ports: {}
+
+config:
+  receivers:
+    redis:
+      endpoint: "redis-master.default.svc.cluster.local:6379"
+      collection_interval: 15s
+      password: "${env:REDIS_PASSWORD}"
+      metrics:
+        redis.maxmemory:
+          enabled: true
+        redis.cmd.calls:
+          enabled: true
+        redis.cmd.usec:
+          enabled: true
+        redis.cmd.latency:
+          enabled: true
+
+  processors:
+    memory_limiter:
+      check_interval: 60s
+      limit_mib: ${env:NEW_RELIC_MEMORY_LIMIT_MIB}
+    cumulativetodelta: {}
+    resourcedetection:
+      detectors: [env]
+    batch:
+      timeout: 10s
+      send_batch_size: 1024
+    attributes/cardinality_reduction:
+      actions:
+        - key: process.pid
+          action: delete
+        - key: process.parent_pid
+          action: delete
+        - key: k8s.pod.uid
+          action: delete
+    transform/metadata_nullify:
+      metric_statements:
+        - context: metric
+          statements:
+            - set(description, "")
+            - set(unit, "")
+
+  exporters:
+    otlphttp:
+      endpoint: "${env:NEWRELIC_OTLP_ENDPOINT}"
+      headers:
+        api-key: "${env:NEWRELIC_LICENSE_KEY}"
+
+  service:
+    pipelines:
+      metrics/redis:
+        receivers: [redis]
+        processors: [memory_limiter, resourcedetection, attributes/cardinality_reduction, cumulativetodelta, transform/metadata_nullify, batch]
+        exporters: [otlphttp]
+```
+
+<Callout variant="important">
+**Required changes:**
+* **Redis endpoint** - Replace `redis-master.default.svc.cluster.local:6379` with the Kubernetes service address of your Redis instance (format: `<service-name>.<namespace>.svc.cluster.local:<port>`)
+* **Password** - If your Redis instance does not require authentication, remove the `password` field from the receiver configuration
+</Callout>
+
+</Step>
+
+<Step>
+
+### Install with Helm [#otel-helm-install]
+
+Install the OpenTelemetry Collector using Helm with your `values.yaml` configuration:
+
+```bash
+helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+helm repo update
+helm upgrade --install redis-otel-collector open-telemetry/opentelemetry-collector \
+  --namespace newrelic \
+  --create-namespace \
+  -f values.yaml
+```
+
+</Step>
+
+<Step>
+
+### Verify deployment and data collection [#otel-verify]
+
+Verify that the OpenTelemetry Collector is running and collecting Redis data:
+
+1. Check that the collector pods are running:
+
+    ```bash
+    kubectl get pods -n newrelic -l app.kubernetes.io/name=opentelemetry-collector --watch
+    ```
+
+2. Check the collector logs for any errors:
+
+    ```bash
+    kubectl logs -n newrelic -l app.kubernetes.io/name=opentelemetry-collector -f
+    ```
+
+    Look for successful connections to Redis and New Relic.
+
+3. Run an NRQL query in New Relic to confirm data is arriving:
+
+    ```sql
+    FROM Metric SELECT count(*)
+    WHERE metricName LIKE 'redis.%'
+    AND instrumentation.provider = 'opentelemetry'
+    SINCE 5 minutes ago
+    ```
+
+4. Navigate to **All Entities** in New Relic and look for your Redis instance under the **Redis** entity type.
+
+</Step>
+
+</Steps>
+
+    </TabsPageItem>
+
+  </TabsPages>
+</Tabs>
+
+## Multi-instance monitoring [#multi-instance]
+
+To monitor multiple Redis instances (for example, a primary and replicas), define multiple Redis receivers in your `values.yaml`:
+
+```yaml
+config:
+  receivers:
+    redis/primary:
+      endpoint: "redis-master.default.svc.cluster.local:6379"
+      collection_interval: 15s
+      password: "${env:REDIS_PASSWORD}"
+    redis/replica:
+      endpoint: "redis-replicas.default.svc.cluster.local:6379"
+      collection_interval: 15s
+      password: "${env:REDIS_PASSWORD}"
+
+  service:
+    pipelines:
+      metrics/redis:
+        receivers: [redis/primary, redis/replica]
+        processors: [memory_limiter, resourcedetection, cumulativetodelta, batch]
+        exporters: [otlphttp]
+```
+
+## TLS configuration in Kubernetes [#tls-k8s]
+
+For Redis instances that require TLS, mount the certificates as a Kubernetes secret and reference them in the receiver configuration:
+
+1. Create a secret from your certificate files:
+
+    ```bash
+    kubectl create secret generic redis-tls-certs \
+      --from-file=ca.pem=/path/to/ca.pem \
+      --from-file=cert.pem=/path/to/cert.pem \
+      --from-file=key.pem=/path/to/key.pem \
+      -n newrelic
+    ```
+
+2. Add volume mounts to your `values.yaml`:
+
+    ```yaml
+    extraVolumes:
+      - name: redis-tls
+        secret:
+          secretName: redis-tls-certs
+
+    extraVolumeMounts:
+      - name: redis-tls
+        mountPath: /etc/redis-tls
+        readOnly: true
+    ```
+
+3. Update the receiver configuration to reference the mounted certificates:
+
+    ```yaml
+    config:
+      receivers:
+        redis:
+          endpoint: "redis-master.default.svc.cluster.local:6379"
+          password: "${env:REDIS_PASSWORD}"
+          tls:
+            insecure: false
+            ca_file: /etc/redis-tls/ca.pem
+            cert_file: /etc/redis-tls/cert.pem
+            key_file: /etc/redis-tls/key.pem
+    ```
+
+## Troubleshooting [#troubleshooting]
+
+<CollapserGroup>
+
+  <Collapser id="pod-not-starting" title="Collector pod not starting">
+
+If the collector pod is in a `CrashLoopBackOff` or `Error` state:
+
+1. Check the pod events:
+    ```bash
+    kubectl describe pod -n newrelic -l app.kubernetes.io/name=opentelemetry-collector
+    ```
+
+2. Check the pod logs:
+    ```bash
+    kubectl logs -n newrelic -l app.kubernetes.io/name=opentelemetry-collector --previous
+    ```
+
+3. Common causes:
+    * Invalid YAML in `values.yaml` - Validate with `helm template`
+    * Secret not found - Ensure the secret exists in the correct namespace
+    * Insufficient resources - Increase memory/CPU limits
+
+  </Collapser>
+
+  <Collapser id="connection-refused" title="Connection refused to Redis">
+
+If the collector logs show connection errors to Redis:
+
+1. Verify the Redis service is accessible from within the cluster:
+    ```bash
+    kubectl run redis-test --rm -it --image=redis:latest -- redis-cli -h redis-master.default.svc.cluster.local -p 6379 ping
+    ```
+
+2. Check if network policies are blocking traffic between namespaces.
+
+3. Verify the Redis service endpoint is correct:
+    ```bash
+    kubectl get svc -A | grep redis
+    ```
+
+  </Collapser>
+
+  <Collapser id="no-metrics" title="Pod is running but no metrics in New Relic">
+
+If the collector pod is running but no data appears:
+
+1. Check that the exporter is configured correctly by looking for `otlphttp` export errors in the logs.
+
+2. Verify the New Relic license key is valid.
+
+3. Test connectivity to the OTLP endpoint from within the cluster:
+    ```bash
+    kubectl run curl-test --rm -it --image=curlimages/curl -- curl -v https://otlp.nr-data.net:4318/v1/metrics
+    ```
+
+  </Collapser>
+
+</CollapserGroup>
